@@ -404,7 +404,8 @@ def main():
     if not date:
         raise SystemExit("A bhavcopy date is required.")
 
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "output")
+    default_out = os.path.join(os.path.dirname(os.path.abspath(path)), "output")
+    out_dir = input(f"Output save folder [{default_out}]: ").strip().strip('"').strip("'") or default_out
     run_settlement(date, path, out_dir=out_dir)
 
 
