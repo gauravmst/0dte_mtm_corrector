@@ -6,6 +6,7 @@ import zipfile
 
 import pandas as pd
 import requests
+from xlsxwriter.utility import xl_col_to_name
 
 # Anything smaller than this is an error page or a holiday placeholder, not a bhavcopy.
 MIN_USABLE_BYTES = 500
@@ -24,6 +25,8 @@ NSE_HEADERS = {
 _MONTHS = {m: i for i, m in enumerate(
     ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1
 )}
+# index options that come in NSE's F&O bhavcopy
+NFO_UNDERLYINGS = ("NIFTY", "BANKNIFTY")
 _WEEKLY_MONTH = {**{str(i): i for i in range(1, 10)}, "O": 10, "N": 11, "D": 12}
 
 # "NIFTY 29SEP2026 CE 22750"
@@ -62,40 +65,41 @@ def load_nfo_bhav_df(nfo_bhav_file, expiry_nfo):
     if "UNDRLNG_ST" in df_bhav_nfo.columns:
         df_bhav_nfo["UNDRLNG_ST"] = pd.to_numeric(df_bhav_nfo["UNDRLNG_ST"], errors="coerce")
 
+    df_bhav_nfo["Underlying"] = df_bhav_nfo["Symbol"].str.replace("OPTIDX", "", n=1, regex=False)
     df_bhav_nfo = df_bhav_nfo[
         (df_bhav_nfo["Date"] == pd.to_datetime(expiry_nfo))
-        & (df_bhav_nfo["Symbol"] == "OPTIDXNIFTY")
+        & df_bhav_nfo["Underlying"].isin(NFO_UNDERLYINGS)
+        & df_bhav_nfo["Symbol"].str.startswith("OPTIDX")
     ].copy()
+    # NIFTY and BANKNIFTY share strikes, so the lookup key carries the underlying: "BANKNIFTY55000CE"
+    df_bhav_nfo["Key"] = df_bhav_nfo["Underlying"] + df_bhav_nfo["Strike_Type"].astype(str)
 
     if df_bhav_nfo.empty:
-        return df_bhav_nfo[["Strike_Type", "SETTLEMENT"]]
+        return df_bhav_nfo[["Key", "SETTLEMENT"]]
 
     strike_parts = df_bhav_nfo["Strike_Type"].astype(str).str.extract(r"(\d+)(CE|PE)$")
     df_bhav_nfo["Strike"] = pd.to_numeric(strike_parts[0], errors="coerce")
     df_bhav_nfo["Option_Type"] = strike_parts[1]
 
-    if "UNDRLNG_ST" in df_bhav_nfo.columns:
-        underlying_series = df_bhav_nfo["UNDRLNG_ST"].fillna(df_bhav_nfo["SETTLEMENT"])
-        expiry_day_like = (
-            (df_bhav_nfo["SETTLEMENT"] - df_bhav_nfo["UNDRLNG_ST"]).abs().le(0.01).mean() >= 0.80
-        )
-    else:
-        underlying_series = df_bhav_nfo["SETTLEMENT"]
-        settlement_count = df_bhav_nfo["SETTLEMENT"].dropna().shape[0]
-        unique_settlement_count = df_bhav_nfo["SETTLEMENT"].dropna().nunique()
-        expiry_day_like = settlement_count > 0 and unique_settlement_count <= max(2, int(settlement_count * 0.05))
+    # each underlying has its own spot, so decide "expiry day" and settle per underlying
+    for underlying in df_bhav_nfo["Underlying"].unique():
+        part = df_bhav_nfo[df_bhav_nfo["Underlying"] == underlying]
+        if "UNDRLNG_ST" in part.columns:
+            underlying_series = part["UNDRLNG_ST"].fillna(part["SETTLEMENT"])
+            expiry_day_like = (part["SETTLEMENT"] - part["UNDRLNG_ST"]).abs().le(0.01).mean() >= 0.80
+        else:
+            underlying_series = part["SETTLEMENT"]
+            settlement_count = part["SETTLEMENT"].dropna().shape[0]
+            unique_settlement_count = part["SETTLEMENT"].dropna().nunique()
+            expiry_day_like = settlement_count > 0 and unique_settlement_count <= max(2, int(settlement_count * 0.05))
 
-    if expiry_day_like:
-        ce_mask = df_bhav_nfo["Option_Type"] == "CE"
-        pe_mask = df_bhav_nfo["Option_Type"] == "PE"
-        df_bhav_nfo.loc[ce_mask, "SETTLEMENT"] = (
-            underlying_series.loc[ce_mask] - df_bhav_nfo.loc[ce_mask, "Strike"]
-        ).clip(lower=0)
-        df_bhav_nfo.loc[pe_mask, "SETTLEMENT"] = (
-            df_bhav_nfo.loc[pe_mask, "Strike"] - underlying_series.loc[pe_mask]
-        ).clip(lower=0)
+        if expiry_day_like:
+            ce = part.index[part["Option_Type"] == "CE"]
+            pe = part.index[part["Option_Type"] == "PE"]
+            df_bhav_nfo.loc[ce, "SETTLEMENT"] = (underlying_series.loc[ce] - part.loc[ce, "Strike"]).clip(lower=0)
+            df_bhav_nfo.loc[pe, "SETTLEMENT"] = (part.loc[pe, "Strike"] - underlying_series.loc[pe]).clip(lower=0)
 
-    return df_bhav_nfo[["Strike_Type", "SETTLEMENT"]].drop_duplicates("Strike_Type")
+    return df_bhav_nfo[["Key", "SETTLEMENT"]].drop_duplicates("Key")
 
 
 def load_bfo_bhav_df(bfo_bhav_file, expiry_bfo):
@@ -200,8 +204,8 @@ def _lookup_settlement(exchange, symbol, nfo_px, bfo_px, expiry_nfo, expiry_bfo)
         return None, "OPEN - NOT AN INDEX OPTION (NOT SETTLED)"
     und, year, month, day, strike, opt = parsed
 
-    if exchange == "NFO" and und == "NIFTY":
-        prices, expiry, key = nfo_px, pd.to_datetime(expiry_nfo), f"{strike}{opt}"
+    if exchange == "NFO" and und in NFO_UNDERLYINGS:
+        prices, expiry, key = nfo_px, pd.to_datetime(expiry_nfo), f"{und}{strike}{opt}"
     elif exchange == "BFO" and und == "SENSEX":
         prices, expiry, key = bfo_px, pd.to_datetime(expiry_bfo), f"{strike}{opt}"[-7:]
     else:
@@ -214,25 +218,41 @@ def _lookup_settlement(exchange, symbol, nfo_px, bfo_px, expiry_nfo, expiry_bfo)
     return prices[key], None
 
 
+# columns the realized / unrealized P&L is calculated from
+REQUIRED_POSITION_COLS = ["Exchange", "Symbol", "Net Qty", "Buy Qty", "Sell Qty",
+                          "Buy Avg Price", "Sell Avg Price", "P&L"]
+SUMMARY_VALUE_COLS = ["Realized Profit", "Unrealized Profit", "P&L",
+                      "Calculated_Realized_PNL", "Calculated_Unrealized_PNL", "Settled P&L"]
+
+
 def build_settled_positions(position_df, nfo_bhav_df, bfo_bhav_df, expiry_nfo, expiry_bfo):
     """
     Output 1 - compiled position file with settlement columns added.
 
     Every row is kept. Open rows (Net Qty != 0) whose contract expires on expiry_nfo / expiry_bfo
-    are settled at the bhavcopy price:
+    are settled at the bhavcopy price. P&L is built from average prices and quantities:
 
-        Settled P&L = Sell Value - Buy Value + Net Qty x Settlement Price
+        Realized   = (Sell Avg - Buy Avg) x Sell Qty      if Net Qty >= 0
+                     (Sell Avg - Buy Avg) x Buy Qty       if Net Qty <  0
+        Unrealized = (Settlement - Buy Avg) x |Net Qty|   if Net Qty >  0
+                     (Sell Avg - Settlement) x |Net Qty|  if Net Qty <  0
+        Settled P&L = Realized + Unrealized
 
     Flat rows (Net Qty == 0) and open rows that can't be settled keep the reported P&L.
     """
+    missing = [c for c in REQUIRED_POSITION_COLS if c not in position_df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in position file: {missing}")
+
     df = position_df.copy()
-    nfo_px = _price_map(nfo_bhav_df, "Strike_Type", "SETTLEMENT")
+    nfo_px = _price_map(nfo_bhav_df, "Key", "SETTLEMENT")
     bfo_px = _price_map(bfo_bhav_df, "Symbols", "Close Price")
 
-    net, buy, sell, pnl = (
-        pd.to_numeric(df[c], errors="coerce").fillna(0)
-        for c in ["Net Qty", "Buy Value", "Sell Value", "P&L"]
-    )
+    # the Excel formulas read these cells directly, so they must be real numbers
+    for c in ["Net Qty", "Buy Qty", "Sell Qty", "Buy Avg Price", "Sell Avg Price", "P&L"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    net, buy_qty, sell_qty = df["Net Qty"], df["Buy Qty"], df["Sell Qty"]
+    buy_avg, sell_avg, pnl = df["Buy Avg Price"], df["Sell Avg Price"], df["P&L"]
 
     # parse each distinct contract once, not once per user row
     lookups = {
@@ -246,48 +266,92 @@ def build_settled_positions(position_df, nfo_bhav_df, bfo_bhav_df, expiry_nfo, e
     is_open = net != 0
     settled = is_open & price.notna()
 
+    realized = ((sell_avg - buy_avg) * sell_qty).where(net >= 0, (sell_avg - buy_avg) * buy_qty)
+    unrealized = pd.Series(0.0, index=df.index)
+    unrealized = unrealized.mask(settled & (net > 0), (price - buy_avg) * net.abs())
+    unrealized = unrealized.mask(settled & (net < 0), (sell_avg - price) * net.abs())
+
     df["Position Status"] = is_open.map({True: "OPEN", False: "CLOSED"})
     df["Settlement Price"] = price.where(settled)
-    df["Settled P&L"] = pnl.where(~settled, sell - buy + net * price).round(2)
+    df["Calculated_Realized_PNL"] = realized
+    df["Calculated_Unrealized_PNL"] = unrealized
+    df["Settled P&L"] = pnl.where(~settled, realized + unrealized).round(2)
     df["Settle Status"] = "FLAT - NO SETTLEMENT NEEDED"
     df.loc[is_open, "Settle Status"] = reason[is_open]
     df.loc[settled, "Settle Status"] = "SETTLED"
-    df["Settle Formula"] = [
-        f"{s:.2f} - {b:.2f} + ({n:g} x {p:.2f})" if ok else "P&L as reported"
-        for s, b, n, p, ok in zip(sell, buy, net, price, settled)
-    ]
     return df
 
 
 def build_settled_summary(settled_df):
     """Output 2 - one row per user: realized, unrealized, MTM P&L and final settled P&L."""
     df = settled_df.copy()
-    value_cols = ["Realized Profit", "Unrealized Profit", "P&L", "Settled P&L"]
-    for c in value_cols:
+    for c in SUMMARY_VALUE_COLS:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     df["Open Rows"] = df["Position Status"].eq("OPEN")
     df["Settled Rows"] = df["Settle Status"].eq("SETTLED")
     df["Open Unsettled Rows"] = df["Open Rows"] & ~df["Settled Rows"]
 
     summary = (
-        df.groupby(["UserID", "Server"], sort=True)[value_cols + ["Open Rows", "Settled Rows", "Open Unsettled Rows"]]
+        df.groupby(["UserID", "Server"], sort=True)[SUMMARY_VALUE_COLS + ["Open Rows", "Settled Rows", "Open Unsettled Rows"]]
         .sum()
         .reset_index()
     )
     summary["Settlement Impact"] = summary["Settled P&L"] - summary["P&L"]
-    summary[value_cols + ["Settlement Impact"]] = summary[value_cols + ["Settlement Impact"]].round(2)
+    summary[SUMMARY_VALUE_COLS + ["Settlement Impact"]] = summary[SUMMARY_VALUE_COLS + ["Settlement Impact"]].round(2)
     return summary
 
 
+def _write_position_formulas(ws, df):
+    """Replace the calculated columns with live Excel formulas (F2 on a cell shows how it was built)."""
+    col = {name: xl_col_to_name(i) for i, name in enumerate(df.columns)}
+    idx = {name: i for i, name in enumerate(df.columns)}
+    for n in range(len(df)):
+        r = n + 2  # Excel row; row 1 is the header
+        net, bq, sq = (f"{col[c]}{r}" for c in ("Net Qty", "Buy Qty", "Sell Qty"))
+        ba, sa, sp, pnl = (f"{col[c]}{r}" for c in ("Buy Avg Price", "Sell Avg Price", "Settlement Price", "P&L"))
+        cr, cu = f"{col['Calculated_Realized_PNL']}{r}", f"{col['Calculated_Unrealized_PNL']}{r}"
+        formulas = {
+            "Calculated_Realized_PNL": f"=IF({net}<0,({sa}-{ba})*{bq},({sa}-{ba})*{sq})",
+            "Calculated_Unrealized_PNL": (
+                f"=IF(ISNUMBER({sp}),IF({net}>0,({sp}-{ba})*ABS({net}),"
+                f"IF({net}<0,({sa}-{sp})*ABS({net}),0)),0)"
+            ),
+            "Settled P&L": f"=IF(ISNUMBER({sp}),ROUND({cr}+{cu},2),{pnl})",
+        }
+        for name, formula in formulas.items():
+            ws.write_formula(n + 1, idx[name], formula, None, float(df[name].iloc[n]))
+
+
+def _write_summary_formulas(ws, summary_df, settled_df):
+    """Per-user totals as SUMIFS / COUNTIFS over the Position sheet."""
+    last = len(settled_df) + 1
+    pos = {name: f"Position!${xl_col_to_name(i)}$2:${xl_col_to_name(i)}${last}"
+           for i, name in enumerate(settled_df.columns)}
+    col = {name: xl_col_to_name(i) for i, name in enumerate(summary_df.columns)}
+    idx = {name: i for i, name in enumerate(summary_df.columns)}
+    for n in range(len(summary_df)):
+        r = n + 2
+        keys = f"{pos['UserID']},{col['UserID']}{r},{pos['Server']},{col['Server']}{r}"
+        formulas = {c: f"=ROUND(SUMIFS({pos[c]},{keys}),2)" for c in SUMMARY_VALUE_COLS}
+        formulas["Open Rows"] = f'=COUNTIFS({keys},{pos["Position Status"]},"OPEN")'
+        formulas["Settled Rows"] = f'=COUNTIFS({keys},{pos["Settle Status"]},"SETTLED")'
+        formulas["Open Unsettled Rows"] = f"={col['Open Rows']}{r}-{col['Settled Rows']}{r}"
+        formulas["Settlement Impact"] = f"=ROUND({col['Settled P&L']}{r}-{col['P&L']}{r},2)"
+        for name, formula in formulas.items():
+            ws.write_formula(n + 1, idx[name], formula, None, float(summary_df[name].iloc[n]))
+
+
 def save_settled_outputs(settled_df, summary_df, out_dir="."):
-    """Write the two CSVs (Compiled_Position_Settled_<date>.csv, Compiled_Summary_<date>.csv)."""
+    """Write Compiled_Settled_<date>.xlsx with a Position sheet and a Summary sheet, both formula-driven."""
     date = settled_df["Date"].dropna().iloc[0] if "Date" in settled_df.columns and settled_df["Date"].notna().any() else ""
     os.makedirs(out_dir, exist_ok=True)
-    position_path = os.path.join(out_dir, f"Compiled_Position_Settled_{date}.csv")
-    summary_path = os.path.join(out_dir, f"Compiled_Summary_{date}.csv")
-    settled_df.to_csv(position_path, index=False)
-    summary_df.to_csv(summary_path, index=False)
-    return position_path, summary_path
+    path = os.path.join(out_dir, f"Compiled_Settled_{date}.xlsx")
+    with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+        settled_df.to_excel(writer, sheet_name="Position", index=False)
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        _write_position_formulas(writer.sheets["Position"], settled_df)
+        _write_summary_formulas(writer.sheets["Summary"], summary_df, settled_df)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -348,11 +412,11 @@ def fetch_bfo_bhavcopy(date_value):
 
 
 # ---------------------------------------------------------------------------
-# One call: date + positions in, the two output files out
+# One call: date + positions in, the Excel output out
 # ---------------------------------------------------------------------------
 def run_settlement(date, position, out_dir=".", nfo_file=None, bfo_file=None):
     """
-    Paste the expiry date, get both output files.
+    Paste the expiry date, get the Excel output (Position + Summary sheets).
 
         run_settlement("29-09-2026", "Compiled_Position_29-09-2026.csv", out_dir="output")
 
@@ -363,7 +427,7 @@ def run_settlement(date, position, out_dir=".", nfo_file=None, bfo_file=None):
               optional already-downloaded bhavcopy CSV (file object) to use instead of fetching,
               for when an exchange blocks the download.
 
-    Returns (settled_df, summary_df, (position_path, summary_path)).
+    Returns (settled_df, summary_df, xlsx_path).
     """
     date_value = pd.to_datetime(date, dayfirst=True)
     position_df = pd.read_csv(position) if isinstance(position, (str, os.PathLike)) else position
@@ -384,10 +448,10 @@ def run_settlement(date, position, out_dir=".", nfo_file=None, bfo_file=None):
 
     settled = build_settled_positions(position_df, nfo_df, bfo_df, date_value, date_value)
     summary = build_settled_summary(settled)
-    paths = save_settled_outputs(settled, summary, out_dir)
-    print("Saved:", *paths, sep="\n  ")
+    path = save_settled_outputs(settled, summary, out_dir)
+    print("Saved:", path)
     print(settled["Settle Status"].value_counts().to_string())
-    return settled, summary, paths
+    return settled, summary, path
 
 
 def main():
